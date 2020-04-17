@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -17,22 +19,69 @@ import (
 )
 
 func main() {
+	var err error
+
 	var live bool
 	var limit int64
-	var src, dest, dupdest, dedup, keep, drop string
+	var src, dest, dupdest, dedup, move, ignore, moveFile, ignoreFile string
+
 	flag.BoolVar(&live, "live-run", false, "perform changes")
 	flag.Int64Var(&limit, "limit", 0, "stop after n messages")
 	flag.StringVar(&src, "src", "", "source queue")
 	flag.StringVar(&dest, "dest", "", "destination queue")
 	flag.StringVar(&dupdest, "dup-dest", "", "duplicate destination queue")
 	flag.StringVar(&dedup, "dedup", "", "json field name")
-	flag.StringVar(&keep, "keep", "", "message must contain this substring")
-	flag.StringVar(&drop, "drop", "", "message must not contain this substring")
+	flag.StringVar(&move, "move", "", "move messages containing this substring")
+	flag.StringVar(&moveFile, "move-file", "", "move messages containing at least one substring from this file")
+	flag.StringVar(&ignore, "ignore", "", "do not move messages containing this substring")
+	flag.StringVar(&ignoreFile, "ignore-file", "", "do not move messages containing any substring from this file")
 	flag.Parse()
 
-	if src == "" || dest == "" {
+	if move != "" && moveFile != "" {
+		log.Fatalln("--move and --move-file cannot both be specified")
+	}
+
+	if ignore != "" && ignoreFile != "" {
+		log.Fatalln("--ignore and --ignore-file cannot both be specified")
+	}
+
+	if dedup != "" && dupdest == "" {
+		log.Fatalln("--dup-dest required if --dedup specified")
+	}
+
+	if src == "" || (dest == "" && live) {
 		flag.Usage()
-		os.Exit(1)
+		log.Fatalln("--dest must be specified when used with --live-run")
+	}
+
+	// always matches by default
+	moveRegex := regexp.MustCompile(`^`)
+
+	// never matches by default
+	ignoreRegex := regexp.MustCompile(`x^`)
+
+	if move != "" {
+		moveRegex, err = buildRegexp(move)
+		if err != nil {
+			log.Fatalln("--move:", err)
+		}
+	} else if moveFile != "" {
+		moveRegex, err = loadSubstrings(moveFile)
+		if err != nil {
+			log.Fatalln("--move-file:", err)
+		}
+	}
+
+	if ignore != "" {
+		ignoreRegex, err = buildRegexp(ignore)
+		if err != nil {
+			log.Fatalln("--ignore:", err)
+		}
+	} else if ignoreFile != "" {
+		ignoreRegex, err = loadSubstrings(ignoreFile)
+		if err != nil {
+			log.Fatalln("--ignore-file:", err)
+		}
 	}
 
 	srcRegion := urlRegion(src)
@@ -55,10 +104,6 @@ func main() {
 
 	var dupDestSess *session.Session
 	var dupDestClient *sqs.SQS
-
-	if dedup != "" && dupdest == "" {
-		log.Fatalln("--dup-dest required if --dedup specified")
-	}
 
 	srcSess := sess.Copy(&aws.Config{Region: aws.String(srcRegion)})
 	destSess := sess.Copy(&aws.Config{Region: aws.String(destRegion)})
@@ -112,13 +157,13 @@ func main() {
 		var wg sync.WaitGroup
 
 		for _, m := range resp.Messages {
-			if keep != "" && !strings.Contains(*m.Body, keep) {
-				log.Println("not keeping message")
+			if ignoreRegex.MatchString(*m.Body) {
+				log.Printf("ignoring %#q", *m.Body)
 				continue
 			}
 
-			if drop != "" && strings.Contains(*m.Body, drop) {
-				log.Println("dropping message")
+			if !moveRegex.MatchString(*m.Body) {
+				log.Printf("not moving %#q", *m.Body)
 				continue
 			}
 
@@ -227,4 +272,35 @@ func clearMap(m map[string]json.RawMessage) {
 	for k := range m {
 		delete(m, k)
 	}
+}
+
+func loadSubstrings(path string) (*regexp.Regexp, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var substrings []string
+
+	sc := bufio.NewScanner(f)
+
+	for sc.Scan() {
+		substrings = append(substrings, sc.Text())
+	}
+
+	err = sc.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	return buildRegexp(substrings...)
+}
+
+func buildRegexp(substrings ...string) (*regexp.Regexp, error) {
+	for i, s := range substrings {
+		substrings[i] = regexp.QuoteMeta(s)
+	}
+
+	pattern := strings.Join(substrings, "|")
+	return regexp.Compile(pattern)
 }
